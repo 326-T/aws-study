@@ -690,3 +690,702 @@ flowchart LR
 この問題は
 **「細粒度アクセス制御 × 一元メタデータ × 最小運用」＝ Lake Formation**
 を即断できるかがポイントです。
+
+---
+
+# EventBridge で起動される「Lambda 1本」に ETL を詰め込み、外部API待ち（合計約3秒）＋DynamoDB更新をしている。コストと技術的負債を下げたい
+
+## AWS Step Functions（外部API待ちをワークフロー化し、サービス統合でDynamoDB更新）
+
+**適用される制約**
+
+- 外部ベンダーAPI呼び出しが複数（3回）あり、待ち時間が支配的
+- 取得したレスポンスを結合して後続処理したい
+- DynamoDB を2テーブル更新（独立）
+- 既存は「Lambdaモノリス」で技術的負債が高い
+- 最もコスト効率の良い再設計（待ち時間課金を減らしたい）
+- 運用オーバーヘッドは増やしたくない（マネージドで完結したい）
+
+**判断基準**
+
+- 「外部API待ちが長い」＋「処理が複数ステップ」→ **Step Functions**
+- 「Lambdaの実行時間が待ちに引っ張られている」→ **待ち時間をワークフロー側に逃がす**
+- DynamoDB は **Step Functions の AWS SDK 統合**で更新（不要なLambdaを減らす）
+
+**メリット**
+
+- 外部API待ちで **Lambda実行時間（課金）を引き伸ばさない設計**にできる
+- リトライ、タイムアウト、並列、エラー分岐が宣言的に書ける（技術的負債低減）
+- DynamoDB 更新を **サービス統合**で実行でき、Lambda本数を抑えられる
+- 可観測性（実行履歴）が標準で得られる
+
+**デメリット**
+
+- ワークフロー設計（状態遷移、エラー設計）を前提にする
+- 外部APIが「コール→後で結果」型でない場合、API呼び出し自体は何らかの実行主体が必要（API Destination / Lambda 等）
+
+```mermaid
+flowchart LR
+  EB[Amazon EventBridge Rule] --> SF[AWS Step Functions State Machine]
+
+  SF --> APIDest[Amazon EventBridge API Destination]
+  APIDest --> V1[Vendor API 1]
+  APIDest --> V2[Vendor API 2]
+  APIDest --> V3[Vendor API 3]
+
+  SF --> Combine[Combine Responses]
+
+  Combine --> DDB1[Amazon DynamoDB UpdateItem Table 1]
+  Combine --> DDB2[Amazon DynamoDB UpdateItem Table 2]
+```
+
+---
+
+## Amazon EventBridge Pipes（フィルタ＋入力変換を併用して起動パラメータを整える）
+
+**適用される制約**
+
+- 除外条件に加えて、Step Functions の入力を整形したい（不要フィールド削除、名前変更など）
+- それでもコーディングは避けたい
+
+**判断基準**
+
+- 「フィルタ」だけでなく「入力の形を合わせたい」が入る
+- 変換が軽微で済む
+
+**メリット**
+
+- フィルタと簡単な入力整形を同一パイプで完結できる
+- Step Functions のステート入力を安定化できる
+
+**デメリット**
+
+- 複雑な変換ロジック（外部呼び出し、状態保持）は不可
+
+```mermaid
+flowchart LR
+  SQS[(Amazon SQS Queue)] --> Pipes[Amazon EventBridge Pipes]
+  Pipes --> Filter[Filter: cars >= 20]
+  Filter --> Transform[Input Transformation]
+  Transform --> SF[AWS Step Functions State Machine]
+```
+
+---
+
+# Amazon SQS の注文メッセージを AWS Step Functions に渡したい。車が 20 台未満の注文は無視したい（開発労力最小）
+
+## Amazon EventBridge Pipes（SQS→フィルタ→Step Functions 直結）
+
+**適用される制約**
+
+- ソースが Amazon SQS（JSONメッセージ）
+- ターゲットが AWS Step Functions（ワークフロー起動）
+- 条件（車 < 20）は除外したい
+- コーディングを避けたい（開発労力最小）
+
+**判断基準**
+
+- 「SQS から Step Functions へ転送」かつ「フィルタ」かつ「最小開発」→ EventBridge Pipes
+- Lambda/EC2 などの実装が選択肢に出てきたら、まず Pipes を検討
+
+**メリット**
+
+- コード不要で SQS→Step Functions の接続ができる
+- フィルタリングを Pipes 側で実施できる
+- 運用対象（Lambda/EC2）が増えない
+
+**デメリット**
+
+- フィルタ条件が複雑（集計・外部参照・複数メッセージ相関）になると限界がある
+- メッセージ整形が大きく必要な場合は別途変換が必要
+
+```mermaid
+flowchart LR
+  SQS[(Amazon SQS Queue)] --> Pipes[Amazon EventBridge Pipes]
+  Pipes --> Filter[EventBridge Pipes Filter]
+  Filter --> SF[AWS Step Functions State Machine]
+
+  SQSmsg[Order JSON Message] -.-> Pipes
+```
+
+---
+
+# HDFS/HiveとS3/Athenaを統合する
+
+S3/Athenaに寄せる
+
+- **耐久性とコスト**: **S3**が最強。HDFS（EMR内）はクラスターを消すとデータが消える「エフェメラル（一時的）」な性質があるため、長期保存には向きません。
+- **メタデータ統合**: **Glue Data Catalog**に一本化すべきです。Hiveメタストア（EMR内）は管理の手間がかかりますが、GlueならAthenaとEMRの両方から共通の「目次」として参照できます。
+- **移行の労力**: AthenaのSQLと互換性が高いのは同じPresto系のツールです。
+
+---
+
+### 「古い構成」vs「新しい構成」の比較
+
+| 比較項目     | HDFS + Hive (EMR内)              | S3 + Glue Data Catalog             |
+| ------------ | -------------------------------- | ---------------------------------- |
+| **耐久性**   | **低** (クラスター削除で消える)  | **極高** (イレブンナイン)          |
+| **コスト**   | **高** (ストレージ用にEC2が必要) | **低** (使った分だけ)              |
+| **カタログ** | Hive Metastore (個別管理)        | **Glue Data Catalog (共通)**       |
+| **連携**     | EMR内のみが基本                  | **Athena / EMR / Redshift で共有** |
+
+---
+
+### ベストプラクティスの可視化 (Mermaid)
+
+```mermaid
+graph TD
+    subgraph "旧：バラバラな状態"
+        HDFS[(HDFS)] --- HMS[Hive Metastore]
+        S3_old[(S3)] --- Glue_old[Glue Catalog]
+        Athena -- 参照不可 --- HMS
+    end
+
+    subgraph "新：モダンなデータレイク (正解パターン)"
+        S3_new[(Amazon S3)] --- Glue_new[(AWS Glue Data Catalog)]
+        Athena -- "SQLクエリ" --- Glue_new
+        EMR[Amazon EMR / Spark] -- "EMRFS経由で分析" --- Glue_new
+        Glue_new --- S3_new
+    end
+
+    style S3_new fill:#dcf5ff,stroke:#0073bb,stroke-width:2px
+    style Glue_new fill:#dcf5ff,stroke:#0073bb,stroke-width:2px
+
+```
+
+### 試験対策の決め手キーワード
+
+1. **「データの耐久性 (Durability)」** → **S3** を選ぶ（HDFSはNG）。
+2. **「共通のデータカタログ (Common Catalog)」** → **Glue Data Catalog** に統合する。
+3. **「移行の労力最小 (Minimal effort)」** → Athenaのクエリを書き換えずに済むよう、そのままAthenaを使うか、共通カタログを参照させる。
+
+**結論：**
+「Hadoop/Hive」という言葉が出てきたら、AWSではそれを「S3/Glue」というマネージドな環境へ移行させるのが、データエンジニアとしての正解ルートになります。
+
+次は、EMRがS3をHDFSのように扱うための仕組みである **EMRFS** について詳しく見てみましょうか？
+
+---
+
+# 外部クラウドデータウェアハウスにある大規模データを、労力最小で Amazon Redshift に移行したい
+
+## AWS Schema Conversion Tool + AWS Glue Studio（異種DWH→Redshift 移行の統合ソリューション）
+
+**適用される制約**
+
+- ソースは外部クラウドデータウェアハウス（異種環境）
+- ターゲットは Amazon Redshift
+- 大規模な既存データセットを移行したい
+- スキーマ互換性の問題を手作業で解決したくない
+- データ移行作業の実装・運用コストを最小化したい
+
+**判断基準**
+
+- 「異種DWH → Redshift」＝ スキーマ変換とデータ移行の両方が必須
+- スキーマ変換を自動化できる専用ツールが必要
+- 大量データを GUI ベースで安全に移行できる手段が必要
+- UNLOAD / COPY / 手書きDDL を避けたい
+
+**メリット**
+
+- AWS Schema Conversion Tool により、外部DWHのスキーマとDDLを自動で Redshift 互換に変換できる
+- AWS Glue Studio により、変換済みスキーマを前提として大規模データを効率的に Redshift にロードできる
+- スキーマ変換とデータ移行を役割分担させつつ、**一連の移行ソリューションとして成立**する
+- 手動DDL作成や個別ETL実装を避けられ、全体の移行工数を最小化できる
+
+**デメリット**
+
+- SCT で自動変換できない一部の型や構文はレビュー・調整が必要
+- Glue Studio のコネクタ対応範囲に依存する
+- 移行性能や並列度はデータ量に応じて調整が必要な場合がある
+
+```mermaid
+flowchart LR
+  Src[External Cloud Data Warehouse]
+  SCT[AWS Schema Conversion Tool]
+  Glue[AWS Glue Studio Job]
+  RS[Amazon Redshift]
+
+  Src --> SCT
+  Src --> Glue
+  SCT --> RS
+  Glue --> RS
+```
+
+この設問は
+**「異種DWH移行では、スキーマ変換とデータ移行を分離せず、SCT + Glue Studio を一体の移行ソリューションとして選べるか」**
+を見ています。
+
+---
+
+# Amazon EKS 上の多数マイクロサービス（複数クラスター/ノードグループ/数百Pod）のメトリクスとログを一元可視化し、ほぼリアルタイムにクエリ結果を表示したい
+
+## Amazon CloudWatch Container Insights + Amazon CloudWatch Logs サブスクリプションフィルター + Amazon Data Firehose + Amazon OpenSearch Service（メトリクスはCloudWatch、ログはOpenSearchで低レイテンシ検索）
+
+**適用される制約**
+
+- 対象は Amazon EKS（クラスター/Pod/コンテナ単位の詳細メトリクスが必要）
+- ログとメトリクスを一元的に表示したい
+- デバッグ/検索のためにログを低レイテンシでクエリしたい（ほぼリアルタイム）
+- マルチクラスター・大規模Podでスケールが必要
+- 運用オーバーヘッドを最小化したい（マネージド中心）
+
+**判断基準**
+
+- 「EKSの詳細メトリクス」→ Amazon CloudWatch Container Insights
+- 「ログのほぼリアルタイム検索・可視化」→ OpenSearch（インデックス検索）
+- 「CloudWatch Logs からほぼリアルタイムで別基盤へ配信」→ サブスクリプションフィルター
+- 「配信/バッファ/再試行をマネージド化」→ Amazon Data Firehose
+
+**メリット**
+
+- Container Insights で EKS のクラスター/Pod/コンテナの詳細メトリクスを標準収集できる
+- CloudWatch Logs → Firehose → OpenSearch により、ログをほぼリアルタイムでインデックス化して高速検索できる
+- マネージドサービス中心で、独自エージェント/独自基盤の運用を避けられる
+- 監視（CloudWatch）と検索（OpenSearch）を役割分担できる
+
+**デメリット**
+
+- ログを OpenSearch に送るための設計（インデックス設計、保持、容量計画）が必要
+- 可視化を一枚にまとめる場合、CloudWatch と OpenSearch Dashboards の使い分け/統合方針が必要
+
+```mermaid
+flowchart LR
+  EKS[Amazon EKS Clusters]
+  CI[Amazon CloudWatch Container Insights]
+  CWL[Amazon CloudWatch Logs]
+  Sub[CloudWatch Logs Subscription Filter]
+  FH[Amazon Data Firehose]
+  OS[Amazon OpenSearch Service]
+  Dash[OpenSearch Dashboards]
+  CW[Amazon CloudWatch Dashboards]
+
+  EKS --> CI --> CW
+  EKS --> CWL --> Sub --> FH --> OS --> Dash
+```
+
+---
+
+# さまざまな AWS データセット／ファイル形式から PII を検出し、データプレパレーション中にマスキングしたい（2つ選択）
+
+## AWS Glue Studio（ETLベースで柔軟に PII 検出・マスキング）
+
+**適用される制約**
+
+- 複数の AWS データセットを対象にしたい（S3 など）
+- CSV / JSON / Parquet など複数のファイル形式
+- データプレパレーション工程で PII を検出したい
+- マスキング処理を組み込みたい
+- コードを書かずに済む部分は減らしたいが、柔軟性も必要
+
+**判断基準**
+
+- 「ETL パイプラインの中で PII 検出＋マスキングを行いたい」
+- 「変換ロジックを柔軟に制御したい」
+
+**メリット**
+
+- 多様なデータソース／ファイル形式に対応
+- ETL 処理の一部として PII 検出・マスキングを実装できる
+- Glue の他ジョブ（クレンジング、正規化等）と統合しやすい
+
+**デメリット**
+
+- ジョブ設計・実行管理は必要
+- DataBrew よりは設計自由度が高い分、学習コストがある
+
+```mermaid
+flowchart LR
+  Src[Various AWS Datasets]
+  Glue[AWS Glue Studio ETL Job]
+  Mask[PII Detection and Masking]
+  S3[(Amazon S3 Output)]
+
+  Src --> Glue --> Mask --> S3
+```
+
+---
+
+## AWS Glue DataBrew（ノーコードでの PII 検出・マスキング）
+
+**適用される制約**
+
+- データプレパレーションが主目的
+- PII を検出してマスキングしたい
+- コーディングによる運用負荷を極力下げたい
+- 多様なファイル形式を扱いたい
+
+**判断基準**
+
+- 「データプレパレーション」「ノーコード」
+- 「PII 検出・編集を簡単に行いたい」
+
+**メリット**
+
+- PII 検出・マスキング機能が組み込み済み
+- GUI 操作のみで変換を定義できる
+- CSV / JSON / XLSX / Parquet / ORC など幅広い形式に対応
+- 実装・保守のオーバーヘッドが最小
+
+**デメリット**
+
+- 複雑なカスタムロジックには不向き
+- 完全なETL基盤としては Glue Studio に劣る
+
+```mermaid
+flowchart LR
+  Src[Various AWS Datasets]
+  Brew[AWS Glue DataBrew]
+  Mask[Built-in PII Detection and Masking]
+  S3[(Amazon S3 Output)]
+
+  Src --> Brew --> Mask --> S3
+```
+
+---
+
+この問題は、
+
+- **PII を「検出するだけ」では不十分**
+- **マスキングを「データプレパレーション中」に行えること**
+- **さまざまなデータセット／形式に対応できること**
+
+という制約から、
+
+- **AWS Glue Studio**
+- **AWS Glue DataBrew**
+
+を **役割の異なるが要件を満たす2解**として選ばせる設問です。
+
+---
+
+# オンプレの Apache Hadoop クラスターで多様なバッチ処理（Spark / Hive / Presto / TensorFlow）を実行している。データ量増加に備えて AWS に移行し、ストレージをスケールさせ、耐久性を上げ、既存ジョブを再利用したい（最もコスト効率）
+
+## Amazon EMR + Amazon S3（データはS3、計算は一時的EMRクラスター）
+
+**適用される制約**
+
+- 既存ジョブをそのまま再利用したい（Spark / Hive / Presto / TensorFlow）
+- ストレージのスケーラビリティが最重要（データ量が大幅増）
+- **データの耐久性を高めたい（HDFSのエフェメラル性を避けたい）**
+- バッチ処理中心（常時稼働クラスター不要）
+- 最もコスト効率が重要
+
+**判断基準**
+
+- 「Hadoop系フレームワークを再利用」→ Amazon EMR
+- 「耐久性＋スケールするストレージ」→ Amazon S3
+- 「バッチ中心でコスト最適化」→ 一時的（エフェメラル）EMR クラスター
+
+**メリット**
+
+- Amazon S3 をストレージ基盤にすることで高耐久・高スケール・低コスト
+- EMR で既存の Hadoop/Spark/Hive/Presto/TensorFlow ジョブを再利用できる
+- 一時クラスター運用で、アイドル時の計算コストを抑えられる
+- HDFS運用（容量計画・障害時データ喪失リスク）を最小化できる
+
+**デメリット**
+
+- ジョブ実行のたびにクラスター起動時間が入る（超低レイテンシ用途は不向き）
+- ログ／依存関係（ライブラリ、ブートストラップ）の再現性設計が必要
+
+```mermaid
+flowchart LR
+  S3[(Amazon S3 Data Lake)]
+  EMR[Amazon EMR Ephemeral Cluster]
+  Jobs[Apache Spark / Apache Hive / Presto / TensorFlow Jobs]
+
+  S3 --> EMR
+  Jobs --> EMR
+  EMR --> S3
+```
+
+---
+
+# サーバーレスデータパイプラインを「週次で確実に」動かし、Amazon QuickSight のデータを自動更新したい（運用オーバーヘッド最小）
+
+## AWS Step Functions + Amazon EventBridge Scheduler（サーバーレス標準・最小運用）
+
+**適用される制約**
+
+- 週次で確実に起動したい（スケジュール駆動）
+- パイプライン全体のオーケストレーションが必要（複数ステップ）
+- サーバーレス前提
+- 運用オーバーヘッド最小（環境運用を増やしたくない）
+
+**判断基準**
+
+- 「サーバーレス」「定期実行」「ワークフロー」→ Step Functions
+- 「cron的スケジュール」→ EventBridge Scheduler
+
+**メリット**
+
+- インフラ運用（Airflow環境など）が不要
+- 失敗時のリトライ/タイムアウト/分岐が組み込みで実装できる
+- スケジュールは Scheduler に集約できる
+
+**デメリット**
+
+- DAG をコードで高度に組みたい用途には向かない（後述）
+
+```mermaid
+flowchart LR
+  Scheduler[Amazon EventBridge Scheduler] --> SF[AWS Step Functions State Machine]
+  SF --> QS[Amazon QuickSight Dataset Refresh]
+```
+
+---
+
+# MWAA が解答になるのはどんなケース？
+
+## Amazon MWAA（Airflow）（DAG主体・多数ジョブ・依存関係が複雑）
+
+**適用される制約**
+
+- タスク数が多い／依存関係が複雑（DAGが大きい、分岐が多い、動的にタスク生成したい等）
+- 既に Airflow を運用している／Airflow の資産（DAG、オペレータ、プラグイン、運用ノウハウ）を流用したい
+- 多様なシステム（AWS外含む）へのコネクタ/オペレータを Airflow で統一したい
+- データパイプラインの「運用管理」を Airflow UI（DAG管理、リラン、SLA、バックフィル、履歴）中心でやりたい
+- 週次に限らず、バックフィルやリカバリ運用が頻繁に必要
+
+**判断基準**
+
+- 「Airflow のDAG/運用を使う前提」または「Step Functions だと表現しづらい DAG 運用要件」がある
+- 具体例キーフレーズ：**backfill / catchup / SLA / DAGの動的生成 / 既存Airflow資産の移植**
+
+**メリット**
+
+- Airflow の表現力（DAG、動的タスク、豊富なOperator/Provider）
+- UIでの運用（再実行、履歴、バックフィル、依存関係の可視化）が強い
+- 複数パイプラインを統一運用しやすい
+
+**デメリット**
+
+- 環境運用が発生（VPC、MWAA環境、依存パッケージ、DAGデプロイ等）
+- 小規模・単純な週次起動には過剰になりやすい
+- コスト/構成要素が増えがち
+
+```mermaid
+flowchart LR
+  MWAA[Amazon MWAA Environment] --> DAG[Apache Airflow DAG]
+  DAG --> Tasks[Operators and Tasks]
+  Tasks --> QS[Amazon QuickSight Dataset Refresh]
+```
+
+---
+
+試験の「コスト効率（Cost-effective）」という観点では、**CloudWatch Logs + Insights よりも、S3 (Parquet) + Athena の方が正解になる確率が高い**です。
+
+理由は、**「ログの取り込みコスト」**と**「クエリの計算コスト」**の両方で S3 ＋ Athena が圧倒的に有利だからです。
+
+---
+
+# S3/Athena vs CloudWatch/CloudWatchInsights
+
+| 項目               | **CloudWatch Logs (+ Insights)** | **Amazon S3 (+ Athena)**                               |
+| ------------------ | -------------------------------- | ------------------------------------------------------ |
+| **取り込み料金**   | **高い** (約 0.50 USD/GB)        | **安い**（実質無料または非常に低額）                   |
+| **ストレージ料金** | **高い** (約 0.03 USD/GB)        | **安い** (約 0.023 USD/GB、さらに安価な階層あり)       |
+| **クエリ料金**     | スキャン 1 GB あたり 0.005 USD   | スキャン 1 TB あたり 5 USD (1 GB あたり **0.005 USD**) |
+| **データ形式**     | 非構造化/JSON                    | **Parquet (列指向圧縮)**                               |
+
+---
+
+### コスト効率の決定打：Parquet の存在
+
+この問題の最大のポイントは選択肢 D の **Parquet 形式** です。
+
+1. **スキャン量の削減**: Athena（および Insights）はスキャンしたデータ量に対して課金されます。Parquet は必要な列だけを読み取り、さらに圧縮されているため、**スキャン量を 80〜90% 削減**できます。
+2. **ログ取り込みの中抜き**: VPC フローログを直接 S3 に送る設定にすれば、高価な CloudWatch Logs の取り込み料金を完全に回避できます。
+
+---
+
+### CloudWatch Logs Insights が正解になるケース
+
+もちろん、Insights が正解になる場合もありますが、それは以下のようなキーワードがある時です。
+
+- **「リアルタイム性が重要」**: 数秒以内のログを即座に確認したい場合。
+- **「運用オーバーヘッドを極限まで減らしたい」**: テーブル定義（DDL）すら書きたくない場合。
+- **「ログの量が極めて少ない」**: S3/Athena の構成を組む手間の方が高くつくレベルの小規模。
+
+---
+
+### 構成イメージ (Mermaid)
+
+```mermaid
+graph LR
+    VPC[VPC Flow Logs] -- "直接出力 (高効率)" --> S3[(Amazon S3<br/>Parquet形式)]
+    S3 -- "必要な列だけスキャン" --> Athena[Amazon Athena]
+    Athena --> User[分析エンジニア]
+
+    style S3 fill:#fff2cc,stroke:#d6b656
+    style Athena fill:#dcf5ff,stroke:#0073bb
+
+```
+
+**結論：**
+「ネットワークトラフィック分析」×「大容量ログ」×「コスト効率」と来たら、**「S3 に Parquet で出して Athena で叩く」** が AWS 試験における鉄板の解答パターンです。
+
+---
+
+# IoT センサー（10秒ごとに 100KB）を Amazon S3 に配信し、ダウンストリームが 30 秒ごとに S3 から読む。レイテンシーを最小化したい
+
+## Amazon Kinesis Data Streams + Kinesis Client Library + Amazon S3（カスタム短間隔バッファで低レイテンシ配信）
+
+**適用される制約**
+
+- S3 への到達レイテンシーを最小化したい
+- ダウンストリームが 30 秒ごとに S3 をポーリング（到達遅延が致命）
+- Amazon Data Firehose のデフォルト（S3宛てバッファ間隔が長い）では満たせない
+- 追加の変換要件はなく、配信が主目的
+
+**判断基準**
+
+- 「S3 へ最小レイテンシで到達」かつ「Firehose のバッファが要件に合わない」→ Kinesis Data Streams + カスタムコンシューマ
+- バッファ間隔を秒単位で制御したい → KCL（または同等の自前実装）
+
+**メリット**
+
+- バッファ間隔を短くでき、S3 への到達レイテンシーを小さくできる
+- Kinesis Data Streams により取り込みはスケールしやすい
+- ダウンストリームの 30 秒間隔読み取りに合わせやすい
+
+**デメリット**
+
+- コンシューマ（KCL 実装）の開発・運用が発生する
+- S3 への書き込み頻度が上がるため、小さなオブジェクトが増えやすい（パーティション/集約設計が必要）
+
+```mermaid
+flowchart LR
+  Sensors[IoT Sensors] --> KDS[Amazon Kinesis Data Streams]
+  KDS --> KCL[Amazon EC2 Consumer with Kinesis Client Library]
+  KCL --> S3[(Amazon S3 Bucket)]
+  S3 --> Downstream[Downstream Process every 30s]
+```
+
+## Amazon Kinesis Data Streams + AWS Lambda コンシューマ + Amazon S3（サーバレス寄りで短間隔集約）
+
+**適用される制約**
+
+- S3 への到達レイテンシーを下げたい
+- コンシューマをサーバレスに寄せたい（EC2 運用を避けたい）
+- 多少の実装は許容できる（集約して PutObject する）
+
+**判断基準**
+
+- 「低レイテンシ配信」＋「EC2 を避けたい」→ Kinesis Data Streams + Lambda
+- Firehose のバッファ制約がボトルネック → ストリーム＋自前配信に寄せる
+
+**メリット**
+
+- EC2 なしで運用負荷を下げられる
+- Kinesis Data Streams の取り込み耐性は維持できる
+- 30 秒要件に合わせた集約・出力制御が可能
+
+**デメリット**
+
+- Lambda 側で集約・順序・再試行時の重複対策（冪等性）が必要
+- 書き込み頻度/オブジェクト数の設計が必要
+
+```mermaid
+flowchart LR
+  Sensors[IoT Sensors] --> KDS[Amazon Kinesis Data Streams]
+  KDS --> Lambda[AWS Lambda Consumer]
+  Lambda --> S3[(Amazon S3 Bucket)]
+  S3 --> Downstream[Downstream Process (every 30s)]
+```
+
+---
+
+# 複数ソースの売上データを可視化するプロトタイプを AWS 上で作りたい。将来のスケールにも対応したい（運用オーバーヘッド最小）
+
+## Amazon S3 + AWS Glue Data Catalog + Amazon Athena + Amazon QuickSight（サーバーレスで直接可視化）
+
+**適用される制約**
+
+- 複数ソースのデータを集約して可視化したい
+- まずはプロトタイプ（シンプルに始めたい）
+- 将来的なスケーラビリティが必要
+- 運用オーバーヘッドを最小化したい（DWH管理を避けたい）
+- SQL で分析・可視化したい（QuickSight）
+
+**判断基準**
+
+- 「プロトタイプ」「最小運用」「スケール」→ S3 + Athena + QuickSight
+- Redshift 等の DWH へのロード運用を避けたい
+- 手動で CSV 取り回ししたくない（QuickSight が Athena を直接参照できる）
+
+**メリット**
+
+- 全体がサーバーレスで運用が軽い（クラスター管理不要）
+- S3 でスケールし、Athena で都度クエリ可能
+- QuickSight が Athena をデータソースとして直接利用できる（中間ファイル不要）
+- プロトタイプ→本番へ拡張しやすい
+
+**デメリット**
+
+- 高頻度・重いダッシュボードでは Athena のスキャン課金と性能設計が論点になり得る
+- スキーマ管理（パーティション設計、カタログ更新方針）が必要
+
+```mermaid
+flowchart LR
+  Sources[Multiple Sales Data Sources] --> S3[(Amazon S3 Data Lake)]
+  S3 --> Catalog[AWS Glue Data Catalog]
+  Athena[Amazon Athena] --> Catalog
+  QuickSight[Amazon QuickSight] --> Athena
+  Athena --> S3
+```
+
+---
+
+申し訳ありません。
+**このケースは「1つの統合ソリューション」として書くべき問題**でした。
+以下、**1ソリューションとしてまとめて**記述します。
+
+---
+
+# AWS Lake Formation 管理の S3 データレイクで発生する全イベントを捕捉し、Amazon QuickSight で監査レポートを作成したい
+
+## AWS CloudTrail（証跡）＋ Amazon Athena ＋ Amazon QuickSight（監査イベント分析の統合ソリューション）
+
+**適用される制約**
+
+- Amazon S3 上のデータレイクは **AWS Lake Formation** で管理・保護されている
+- **すべての Lake Formation イベント**（管理イベント・データイベント）を捕捉したい
+- 大量のイベントを **SQL で大規模分析**したい
+- **Amazon QuickSight** で監査レポートを作成したい
+- 運用上のオーバーヘッドを最小限に抑えたい（独自ETL・常駐基盤を避けたい）
+
+**判断基準**
+
+- 「Lake Formation の操作履歴をすべて記録」→ **AWS CloudTrail 証跡**
+- 「大規模ログを SQL で分析」→ **Amazon Athena**
+- 「監査レポート可視化」→ **Amazon QuickSight（Athena データソース）**
+- CloudTrail Lake は **QuickSight 非対応**のため不採用
+
+**メリット**
+
+- CloudTrail 証跡により **Lake Formation の全操作を継続的に捕捉**
+- S3 に保存された CloudTrail ログを Athena で **サーバーレスに分析**
+- Athena をデータソースとして QuickSight で **監査レポートを直接作成**
+- Glue ETL や独自ワークフロー不要で **運用オーバーヘッドが最小**
+
+**デメリット**
+
+- CloudTrail データイベント有効化によりログ量が増加する可能性
+- Athena クエリ最適化（パーティション設計）が必要
+
+```mermaid
+flowchart LR
+  LF[AWS Lake Formation]
+  CT[AWS CloudTrail Trail]
+  S3[(Amazon S3 CloudTrail Logs)]
+  Athena[Amazon Athena]
+  QS[Amazon QuickSight]
+
+  LF --> CT
+  CT --> S3
+  S3 --> Athena
+  Athena --> QS
+```
+
+CloudTrailをQuickSightで表示するにはAthenaを噛ませる必要がある
